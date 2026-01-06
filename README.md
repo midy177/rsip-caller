@@ -9,10 +9,11 @@
 - ✅ 200 OK 响应处理
 - ✅ 基本 RTP 音频流建立
 - ✅ 多协议传输支持（UDP、TCP、WebSocket、WebSocket Secure）
+- ✅ IPv4 和 IPv6 双栈支持（自动回退）
+- ✅ Outbound 代理支持
 - ✅ 异步处理（基于 tokio）
 - ✅ 线程安全（使用 Arc/Mutex）
 - ✅ 完整的错误处理
-- ✅ 支持 IPv6
 - ✅ 完整的单元测试和文档测试
 
 ## 项目结构
@@ -108,10 +109,12 @@ cargo run
 |------|--------|----------|--------|------|
 | `--server` | `-s` | `SIP_SERVER` | `127.0.0.1:5060` | SIP 服务器地址 |
 | `--protocol` | - | - | `udp` | 传输协议类型（udp/tcp/ws/wss） |
+| `--outbound-proxy` | - | - | 无 | Outbound 代理服务器地址（可选） |
 | `--user` | `-u` | `SIP_USER` | `alice@example.com` | SIP 用户 ID |
 | `--password` | `-p` | `SIP_PASSWORD` | `password` | SIP 密码 |
 | `--target` | `-t` | `SIP_TARGET` | `bob@example.com` | 呼叫目标 |
 | `--local-port` | - | - | `0` | 本地 SIP 端口（0 表示自动分配） |
+| `--ipv6` | - | - | `false` | 优先使用 IPv6（找不到时自动回退到 IPv4） |
 | `--rtp-start-port` | - | - | `20000` | RTP 起始端口 |
 | `--echo-mode` | - | - | `true` | 是否启用回声模式 |
 | `--user-agent` | - | - | `RSipCaller/0.2.0` | 用户代理字符串 |
@@ -141,6 +144,75 @@ cargo run -- --server 192.168.1.100:8080 --protocol ws
 # 使用 WebSocket Secure
 cargo run -- --server 192.168.1.100:443 --protocol wss
 ```
+
+### IPv6 支持说明
+
+SIP Caller 支持 IPv4 和 IPv6 双栈网络：
+
+- **默认行为（IPv4）**: 优先使用 IPv4 地址，如果找不到 IPv4 接口则自动回退到 IPv6
+- **启用 IPv6**: 使用 `--ipv6` 参数优先使用 IPv6 地址，找不到时自动回退到 IPv4
+
+智能回退机制确保在各种网络环境下都能正常工作。
+
+使用示例：
+
+```bash
+# 默认使用 IPv4
+cargo run -- --server 192.168.1.100:5060
+
+# 优先使用 IPv6（找不到时自动回退到 IPv4）
+cargo run -- --server 192.168.1.100:5060 --ipv6
+
+# 在纯 IPv6 环境中
+cargo run -- --server [2001:db8::1]:5060 --ipv6
+
+# 组合使用：TCP + IPv6
+cargo run -- --server 192.168.1.100:5060 --protocol tcp --ipv6
+```
+
+### Outbound 代理支持
+
+Outbound 代理（Outbound Proxy）允许所有 SIP 请求通过指定的代理服务器转发，这在以下场景中非常有用：
+
+- **NAT 穿越**：通过代理服务器解决 NAT 问题
+- **企业网络**：符合企业网络架构要求
+- **负载均衡**：通过代理实现负载均衡
+- **安全控制**：集中管理和监控 SIP 流量
+
+#### 工作原理
+
+当指定 Outbound 代理时：
+1. 客户端连接到代理服务器而不是目标 SIP 服务器
+2. SIP 消息中的目标 URI 仍然是原始服务器
+3. 代理负责将请求转发到实际的 SIP 服务器
+
+#### 使用示例
+
+```bash
+# 基本用法：通过代理连接到 SIP 服务器
+cargo run -- --server sip.example.com:5060 --outbound-proxy proxy.example.com:5060
+
+# 使用 TCP 协议和代理
+cargo run -- --server sip.example.com:5060 --protocol tcp --outbound-proxy proxy.example.com:5060
+
+# 组合使用：代理 + IPv6 + TCP
+cargo run -- --server sip.example.com:5060 --protocol tcp --ipv6 --outbound-proxy proxy.example.com:5060
+
+# 企业环境示例
+cargo run -- \
+  --server internal-sip.company.com:5060 \
+  --outbound-proxy corporate-proxy.company.com:5060 \
+  --user alice@company.com \
+  --password secret \
+  --target bob@company.com
+```
+
+#### 注意事项
+
+- 代理地址格式：`hostname:port` 或 `ip:port`
+- 代理必须支持相应的传输协议（UDP/TCP/WS/WSS）
+- 确保防火墙允许连接到代理服务器
+- 代理和目标服务器可以使用不同的端口
 
 ### 运行测试
 

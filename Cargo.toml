@@ -24,5 +24,7 @@ bytes = "1.5"
 tokio-util = "0.7"
 get_if_addrs = "0.5"
 rtp-rs = "0.6"
+async-trait = "0.1"
+chrono = "0.4.42"
 
 [dev-dependencies]

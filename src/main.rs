@@ -4,12 +4,14 @@ use clap::Parser;
 /// 演示如何使用 rsipstack 进行注册和呼叫
 mod config;
 mod dialog;
+pub mod registration;
 mod rtp;
 mod transport;
 mod utils;
 
 use config::Protocol;
 use dialog::process_dialog;
+use registration::{RegistrarFactory, RegistrarFactoryConfig, RegistrationConfig};
 use transport::{create_transport_connection, extract_peer_rtp_addr};
 use utils::get_first_non_loopback_interface;
 
@@ -17,7 +19,6 @@ use rand::Rng;
 use rsipstack::{
     dialog::{
         authenticate::Credential, dialog_layer::DialogLayer, invitation::InviteOption,
-        registration::Registration,
     },
     transport::TransportLayer,
     EndpointBuilder,
@@ -36,28 +37,36 @@ use tracing::{debug, error, info, warn};
 #[command(about = "SIP 客户端，支持注册和呼叫功能", long_about = None)]
 struct Args {
     /// SIP 服务器地址（例如：127.0.0.1:5060）
-    #[arg(short, long, default_value = "pbx.ras.yeastar.com:5060")]
+    #[arg(short, long, default_value = "xfc:5060")]
     server: String,
 
     /// 传输协议类型 (udp, tcp, ws, wss)
     #[arg(long, default_value = "udp")]
     protocol: Protocol,
 
+    /// Outbound 代理服务器地址（可选，例如：proxy.example.com:5060）
+    #[arg(long)]
+    outbound_proxy: Option<String>,
+
     /// SIP 用户 ID（例如：alice@example.com）
-    #[arg(short, long, default_value = "6634")]
+    #[arg(short, long, default_value = "1001")]
     user: String,
 
     /// SIP 密码
-    #[arg(short, long, default_value = "B5ULy6h6J9")]
+    #[arg(short, long, default_value = "admin")]
     password: String,
 
     /// 呼叫目标（例如：bob@example.com）
-    #[arg(short, long, default_value = "6737")]
+    #[arg(short, long, default_value = "1000")]
     target: String,
 
     /// 本地 SIP 端口
     #[arg(long, default_value = "0")]
     local_port: u16,
+
+    /// 优先使用 IPv6（找不到时自动回退到 IPv4）
+    #[arg(long, default_value = "false")]
+    ipv6: bool,
 
     /// RTP 起始端口
     #[arg(long, default_value = "20000")]
@@ -97,8 +106,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_max_level(log_level).init();
 
     info!(
-        "SIP Caller 启动 - 服务器: {}, 协议: {}, 用户: {}, 目标: {}, RTP端口: {}, User-Agent: {}",
-        args.server, args.protocol, args.user, args.target, args.rtp_start_port, args.user_agent
+        "SIP Caller 启动 - 服务器: {}, 协议: {}, 代理: {}, 用户: {}, 目标: {}, IPv6: {}, RTP端口: {}, User-Agent: {}",
+        args.server,
+        args.protocol,
+        args.outbound_proxy.as_deref().unwrap_or("无"),
+        args.user,
+        args.target,
+        args.ipv6,
+        args.rtp_start_port,
+        args.user_agent
     );
 
     let cancel_token = CancellationToken::new();
@@ -107,15 +123,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport_layer = TransportLayer::new(cancel_token.clone());
 
     // 获取本地 IP
-    let local_ip = get_first_non_loopback_interface()?;
-    info!("检测到本地出口IP: {}", local_ip);
+    let local_ip = get_first_non_loopback_interface(args.ipv6)?;
+    info!(
+        "检测到本地出口IP: {} ({})",
+        local_ip,
+        if local_ip.is_ipv6() { "IPv6" } else { "IPv4" }
+    );
+
+    // 确定实际连接的服务器地址（如果有 Outbound 代理则连接到代理）
+    let connection_target = args.outbound_proxy.as_ref().unwrap_or(&args.server);
+    if args.outbound_proxy.is_some() {
+        info!("使用 Outbound 代理: {}", connection_target);
+    }
 
     // 根据协议类型创建传输连接
     let local_addr = format!("{}:{}", local_ip, args.local_port).parse()?;
     let connection = create_transport_connection(
         args.protocol,
         local_addr,
-        &args.server,
+        connection_target,
         cancel_token.clone(),
     )
     .await?;
@@ -194,42 +220,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(5060u16);
 
-    // 构造 URI
-    let server_uri = format!("sip:{}:{}", server_host, server_port);
-    let server_uri_parsed: rsip::Uri = server_uri.as_str().try_into()?;
+    // 构造 Registration URI
+    // 当使用 Outbound 代理时，如果 server_host 不是有效的IP/域名（如租户ID），
+    // 使用代理地址作为 Register URI，租户信息保留在 domain_for_from_to 中
+    let is_tenant_id = args.outbound_proxy.is_some()
+        && !server_host.contains('.')  // 不包含点（不是域名或IP）
+        && !server_host.parse::<std::net::IpAddr>().is_ok();  // 不是有效IP
+
+    let (register_uri_str, domain_for_from_to) = if is_tenant_id {
+        // 租户ID模式：使用租户地址作为 Register URI（匹配话机行为）
+        info!("检测到租户ID: {}, 使用 Outbound 代理模式", server_host);
+        (
+            format!("sip:{}:{}", server_host, server_port),  // 使用租户地址！
+            server_host.to_string(),  // 保留租户ID用于From/To
+        )
+    } else if args.outbound_proxy.is_some() {
+        // 有代理但 server 是正常域名/IP
+        (
+            format!("sip:{}:{}", server_host, server_port),
+            server_host.to_string(),
+        )
+    } else {
+        // 无代理模式
+        let uri = format!("sip:{}:{}", server_host, server_port);
+        (uri.clone(), server_host.to_string())
+    };
+
+    let server_uri_parsed: rsip::Uri = register_uri_str.as_str().try_into()?;
     let contact_uri_str = format!("sip:{}@{}", args.user, actual_local_addr);
 
     info!(
-        "Server URI: {}, Contact URI: {}",
-        server_uri, contact_uri_str
+        "Register URI: {}, Contact URI: {}, 租户域名: {}",
+        register_uri_str, contact_uri_str, domain_for_from_to
     );
 
-    // 创建认证凭证
-    let credential = Credential {
-        username: args.user.clone(),
-        password: args.password.clone(),
-        realm: None, // rsipstack 会自动从 401 响应中提取
-    };
-
-    // 使用 rsipstack 内置的 Registration
-    info!("正在注册到 SIP 服务器...");
-
-    let mut registration = Registration::new(endpoint.inner.clone(), Some(credential.clone()));
+    if is_tenant_id {
+        info!(
+            "多租户模式 -> 物理连接: {}, Register URI: {}, From/To域名: {}",
+            connection_target, register_uri_str, domain_for_from_to
+        );
+    }
 
     // 使用自定义的 make_call_id 函数（基于 UUID）
     let register_call_id = utils::make_uuid_call_id();
     info!("生成注册 Call-ID: {}", register_call_id.to_string());
-    registration.call_id = register_call_id;
+
+    // 创建注册配置
+    let mut registration_config = RegistrationConfig::new(args.user.clone(), args.password.clone())
+        .with_call_id(register_call_id.clone())
+        .with_contact_uri(contact_uri_str.clone())
+        .with_expires(3600);
+
+    // 如果是租户ID，设置 realm
+    if is_tenant_id {
+        registration_config = registration_config.with_realm(server_host.to_string());
+    }
 
     // 注意: EndpointBuilder.with_user_agent() 会为所有请求设置 User-Agent
     // 包括 REGISTER 和 INVITE 请求
 
-    match registration
-        .register(server_uri_parsed.clone(), Some(3600))
-        .await
-    {
+    info!("正在注册到 SIP 服务器...");
+
+    // 使用工厂模式创建注册器
+    let registrar_type = RegistrarFactory::auto_detect(server_host, args.outbound_proxy.is_some());
+
+    let factory_config = match registrar_type {
+        registration::RegistrarType::OutboundProxy => {
+            info!("使用 Outbound 代理注册模式");
+            RegistrarFactoryConfig::outbound_proxy(
+                registration_config,
+                domain_for_from_to.clone(),
+                connection_target.to_string(),
+            )
+        }
+        registration::RegistrarType::Standard => {
+            info!("使用标准注册模式");
+            RegistrarFactoryConfig::standard(registration_config)
+        }
+    };
+
+    let mut registrar = RegistrarFactory::create(endpoint.inner.clone(), factory_config);
+
+    // 执行注册
+    match registrar.register(server_uri_parsed.clone(), Some(3600)).await {
         Ok(response) => {
-            info!("✔ 注册成功,响应状态: {}", response.status_code);
+            if response.status_code == rsip::StatusCode::OK {
+                info!("✔ 注册成功,响应状态: {}", response.status_code);
+
+                // 显示公共地址（如果有）
+                if let Some(public_addr) = registrar.public_address() {
+                    info!("检测到公共地址: {}", public_addr);
+                }
+            } else {
+                warn!("注册响应: {}", response.status_code);
+            }
         }
         Err(e) => {
             error!("❌ 注册失败: {}", e);
@@ -237,17 +321,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // 创建认证凭证（用于后续的 INVITE 请求）
+    let credential = Credential {
+        username: args.user.clone(),
+        password: args.password.clone(),
+        realm: if is_tenant_id {
+            Some(server_host.to_string())
+        } else {
+            None
+        },
+    };
+
     // 等待一段时间确保注册完成
     // tokio::time::sleep(Duration::from_secs(1)).await;
 
     // 发起呼叫
     info!("📞发起呼叫到: {}", args.target);
 
-    let from_uri = format!("sip:{}@{}", args.user, server_host);
+    let from_uri = format!("sip:{}@{}", args.user, domain_for_from_to);
     let to_uri = if args.target.contains('@') {
         format!("sip:{}", args.target)
     } else {
-        format!("sip:{}@{}", args.target, server_host)
+        format!("sip:{}@{}", args.target, domain_for_from_to)
     };
 
     info!("Call信息 源：{} -> 目标：{}", from_uri, to_uri);
@@ -273,6 +368,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let call_id = utils::make_uuid_call_id();
     info!("生成呼叫 Call-ID: {}", call_id.to_string());
 
+    // 在多租户模式下，destination 需要设置为代理地址
+    let destination = if is_tenant_id {
+        info!("多租户模式：INVITE 将发送到代理 {}", connection_target);
+        // 将代理地址转换为 SipAddr
+        let proxy_host_port: rsip::HostWithPort = connection_target.as_str().try_into()?;
+        let sip_addr = rsipstack::transport::SipAddr::new(
+            args.protocol.to_rsip_transport(),
+            proxy_host_port,
+        );
+        Some(sip_addr)
+    } else {
+        None
+    };
+
     let invite_opt = InviteOption {
         caller: from_uri.as_str().try_into()?,
         callee: to_uri.as_str().try_into()?,
@@ -280,7 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         credential: Some(credential),
         caller_display_name: None,
         caller_params: vec![],
-        destination: None,
+        destination,  // 多租户模式下使用代理地址
         content_type: Some("application/sdp".to_string()),
         offer: Some(sdp_offer.as_bytes().to_vec()),
         headers: None, // User-Agent 已在 Endpoint 层面设置
