@@ -1,0 +1,334 @@
+# SIP Caller
+
+基于 Rust 和 rsipstack 的 SIP 客户端库，支持 SIP 服务器注册、INVITE 呼叫、200 OK 响应处理和 RTP 音频流建立。
+
+## 特性
+
+- ✅ SIP 服务器注册
+- ✅ INVITE 呼叫发起
+- ✅ 200 OK 响应处理
+- ✅ 基本 RTP 音频流建立
+- ✅ 多协议传输支持（UDP、TCP、WebSocket、WebSocket Secure）
+- ✅ 异步处理（基于 tokio）
+- ✅ 线程安全（使用 Arc/Mutex）
+- ✅ 完整的错误处理
+- ✅ 支持 IPv6
+- ✅ 完整的单元测试和文档测试
+
+## 项目结构
+
+```
+sip-caller/
+├── src/
+│   ├── main.rs        # 主程序示例
+│   ├── config.rs      # 协议配置定义
+│   ├── transport.rs   # 传输层辅助函数
+│   ├── rtp.rs         # RTP 处理模块
+│   └── utils.rs       # 工具函数
+├── Cargo.toml         # 项目依赖配置
+└── README.md          # 项目文档
+```
+
+## 依赖
+
+- `tokio` - 异步运行时，处理并发网络 I/O
+- `rsipstack` - SIP 协议栈实现（支持 UDP/TCP/WebSocket）
+- `rsip` - SIP 消息解析
+- `thiserror` - 自定义错误类型
+- `tracing` - 结构化日志
+- `uuid` - 呼叫 ID 生成和管理
+- `clap` - 命令行参数解析（支持环境变量）
+
+## 快速开始
+
+### 安装依赖
+
+确保已安装 Rust 1.80+：
+
+```bash
+rustup update
+```
+
+### 编译项目
+
+```bash
+cargo build
+```
+
+### 运行示例
+
+#### 使用命令行参数
+
+```bash
+# 查看帮助信息
+cargo run -- --help
+
+# 使用默认配置（持续通话，按 Ctrl+C 终止）
+cargo run
+
+# 使用自定义参数
+cargo run -- --server 192.168.1.100:5060 --user alice@example.com --target bob@example.com --duration 30
+
+# 持续通话直到手动按 Ctrl+C 终止
+cargo run -- --server 192.168.1.100:5060 --user alice --target bob
+
+# 启用详细日志
+cargo run -- --verbose
+
+# 设置特定日志级别
+cargo run -- --log-level debug
+
+# 简写形式（30秒后自动挂断）
+cargo run -- -s 192.168.1.100:5060 -u alice@example.com -p mypassword -t bob@example.com -d 30 -v
+```
+
+#### 使用环境变量
+
+```bash
+# 设置环境变量
+export SIP_SERVER="192.168.1.100:5060"
+export SIP_USER="alice@example.com"
+export SIP_PASSWORD="mypassword"
+export SIP_TARGET="bob@example.com"
+
+# 运行程序
+cargo run
+
+# 或一次性设置
+SIP_SERVER="192.168.1.100:5060" \
+SIP_USER="alice@example.com" \
+SIP_PASSWORD="mypassword" \
+SIP_TARGET="bob@example.com" \
+cargo run
+```
+
+#### 命令行参数说明
+
+| 参数 | 短参数 | 环境变量 | 默认值 | 说明 |
+|------|--------|----------|--------|------|
+| `--server` | `-s` | `SIP_SERVER` | `127.0.0.1:5060` | SIP 服务器地址 |
+| `--protocol` | - | - | `udp` | 传输协议类型（udp/tcp/ws/wss） |
+| `--user` | `-u` | `SIP_USER` | `alice@example.com` | SIP 用户 ID |
+| `--password` | `-p` | `SIP_PASSWORD` | `password` | SIP 密码 |
+| `--target` | `-t` | `SIP_TARGET` | `bob@example.com` | 呼叫目标 |
+| `--local-port` | - | - | `0` | 本地 SIP 端口（0 表示自动分配） |
+| `--rtp-start-port` | - | - | `20000` | RTP 起始端口 |
+| `--echo-mode` | - | - | `true` | 是否启用回声模式 |
+| `--user-agent` | - | - | `RSipCaller/0.2.0` | 用户代理字符串 |
+| `--log-level` | `-l` | - | `info` | 日志级别（trace/debug/info/warn/error） |
+
+### 协议类型说明
+
+SIP Caller 支持以下传输协议：
+
+- **UDP** (`udp`): 默认协议，无连接传输，适合大多数 SIP 场景
+- **TCP** (`tcp`): 面向连接传输，更可靠但开销稍大
+- **WebSocket** (`ws`): 基于 HTTP 的 WebSocket 传输，适合 Web 应用
+- **WebSocket Secure** (`wss`): 基于 HTTPS 的加密 WebSocket 传输，安全性最高
+
+使用示例：
+
+```bash
+# 使用 UDP（默认）
+cargo run -- --server 192.168.1.100:5060
+
+# 使用 TCP
+cargo run -- --server 192.168.1.100:5060 --protocol tcp
+
+# 使用 WebSocket
+cargo run -- --server 192.168.1.100:8080 --protocol ws
+
+# 使用 WebSocket Secure
+cargo run -- --server 192.168.1.100:443 --protocol wss
+```
+
+### 运行测试
+
+```bash
+# 运行所有单元测试
+cargo test
+
+# 运行单元测试并显示输出
+cargo test -- --show-output
+
+# 运行特定测试
+cargo test test_sip_config_creation
+```
+
+## API 使用示例
+
+### 基本用法
+
+```rust
+use sip_caller::{SipClient, SipConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 创建 SIP 配置
+    let config = SipConfig::new("127.0.0.1:5060", "alice@example.com")?;
+
+    // 2. 创建 SIP 客户端
+    let client = SipClient::new(config).await?;
+
+    // 3. 注册到 SIP 服务器
+    client.register("password").await?;
+
+    // 4. 发起呼叫
+    let call_id = client.call("bob@example.com").await?;
+    println!("呼叫 ID: {}", call_id);
+
+    // 5. 挂断呼叫
+    client.hangup(&call_id).await?;
+
+    Ok(())
+}
+```
+
+### 自定义配置
+
+```rust
+use sip_caller::SipConfig;
+use std::net::SocketAddr;
+
+// 创建自定义配置
+let config = SipConfig::new("192.168.1.100:5060", "alice@example.com")?
+    .with_media_addr("192.168.1.100:20000".parse::<SocketAddr>()?)
+    .with_user_agent("MyApp/2.0".to_string())
+    .with_codecs(vec!["PCMU".to_string(), "G729".to_string()]);
+```
+
+### 错误处理
+
+```rust
+use sip_caller::{SipClient, SipConfig};
+use sip_caller::error::SipCallerError;
+
+#[tokio::main]
+async fn main() {
+    let config = SipConfig::new("127.0.0.1:5060", "alice@example.com")
+        .expect("无效的配置");
+
+    let client = SipClient::new(config).await
+        .expect("创建客户端失败");
+
+    match client.register("password").await {
+        Ok(_) => println!("注册成功"),
+        Err(SipCallerError::RegistrationFailed(msg)) => {
+            eprintln!("注册失败: {}", msg);
+        }
+        Err(e) => eprintln!("其他错误: {}", e),
+    }
+}
+```
+
+## 设计说明
+
+### 架构选择
+
+1. **异步处理**: 使用 tokio 异步框架处理网络 I/O，提高并发性能
+2. **模块化设计**: 将错误处理、配置、客户端逻辑分离到不同模块
+3. **线程安全**: 使用 `Arc<Mutex<>>` 管理共享状态，确保多线程安全
+4. **错误处理**: 使用 `Result<T, SipCallerError>` 明确处理错误，提供有意义的错误信息
+5. **依赖最小化**: 仅使用必要的外部 crate，优先使用标准库
+
+### 错误处理策略
+
+- 所有公共 API 返回 `Result<T, SipCallerError>`
+- 使用 `thiserror` 创建自定义错误类型
+- 错误信息清晰，便于调试
+- 错误传播使用 `?` 运算符
+
+### 并发处理
+
+- 使用 `tokio::sync::Mutex` 保护共享状态
+- 客户端管理器使用 `Arc` 包装，支持多线程访问
+- 所有网络操作都是异步的，避免阻塞
+
+## 测试覆盖
+
+项目包含全面的测试：
+
+### 单元测试
+
+- 错误类型创建和显示
+- SIP 配置验证
+- 客户端创建
+- 配置选项定制
+
+### 文档测试
+
+- API 使用示例
+- 配置创建
+- 注册和呼叫流程
+
+运行测试查看覆盖：
+
+```bash
+cargo test
+```
+
+测试结果示例：
+
+```
+running 7 tests
+test error::tests::test_call_failed_error ... ok
+test error::tests::test_error_creation ... ok
+test error::tests::test_registration_error ... ok
+test tests::test_config_with_custom_codecs ... ok
+test tests::test_invalid_sip_address ... ok
+test tests::test_sip_config_creation ... ok
+test tests::test_client_creation ... ok
+
+test result: ok. 7 passed; 0 failed
+```
+
+## 环境变量
+
+主程序支持以下环境变量（也可以通过命令行参数设置）：
+
+- `SIP_SERVER`: SIP 服务器地址（默认: `127.0.0.1:5060`）
+- `SIP_USER`: SIP 用户 ID（默认: `alice@example.com`）
+- `SIP_PASSWORD`: SIP 密码（默认: `password`）
+- `SIP_TARGET`: 呼叫目标（默认: `bob@example.com`）
+
+**注意**: 命令行参数的优先级高于环境变量。
+
+## 性能和安全
+
+### 性能优化
+
+- 使用异步 I/O 减少线程开销
+- 零拷贝网络传输（rvoip 内部优化）
+- 高效的消息解析
+
+### 安全性
+
+- 避免使用 `unsafe` 代码
+- 使用 Rust 所有权系统防止内存错误
+- 输入验证（SIP URI、地址解析）
+- 错误边界清晰，防止 panic
+
+## 编译检查
+
+```bash
+# 检查代码编译
+cargo check
+
+# 检查代码格式
+cargo fmt --check
+
+# 运行 Clippy 代码检查
+cargo clippy -- -D warnings
+```
+
+## 许可证
+
+本项目仅用于学习和演示目的。
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+## 联系方式
+
+如有问题，请提交 Issue。
