@@ -5,6 +5,31 @@
 use std::net::IpAddr;
 use uuid::Uuid;
 
+/// 初始化日志系统
+///
+/// # 参数
+/// - `log_level`: 日志级别字符串 (trace, debug, info, warn, error)
+///
+/// # 示例
+/// ```rust,no_run
+/// initialize_logging("debug");
+/// ```
+pub fn initialize_logging(log_level: &str) {
+    let level = match log_level.to_lowercase().as_str() {
+        "trace" => tracing::Level::TRACE,
+        "debug" => tracing::Level::DEBUG,
+        "info" => tracing::Level::INFO,
+        "warn" => tracing::Level::WARN,
+        "error" => tracing::Level::ERROR,
+        _ => {
+            eprintln!("无效的日志级别 '{}', 使用默认值 'info'", log_level);
+            tracing::Level::INFO
+        }
+    };
+
+    tracing_subscriber::fmt().with_max_level(level).init();
+}
+
 /// 获取第一个非回环的网络接口 IP 地址
 ///
 /// 遍历系统所有网络接口，优先返回指定版本的 IP 地址，

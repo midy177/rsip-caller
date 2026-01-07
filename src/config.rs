@@ -29,6 +29,7 @@ impl Protocol {
     }
 
     /// 返回协议的默认端口
+    #[cfg(test)]
     pub fn default_port(&self) -> u16 {
         match self {
             Protocol::Udp => 5060,
@@ -39,11 +40,13 @@ impl Protocol {
     }
 
     /// 判断是否为安全协议
+    #[cfg(test)]
     pub fn is_secure(&self) -> bool {
         matches!(self, Protocol::Wss)
     }
 
     /// 判断是否为 WebSocket 协议
+    #[cfg(test)]
     pub fn is_websocket(&self) -> bool {
         matches!(self, Protocol::Ws | Protocol::Wss)
     }

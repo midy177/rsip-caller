@@ -20,9 +20,6 @@ pub struct MediaSessionOption {
     pub external_ip: Option<String>,
     /// 取消令牌
     pub cancel_token: CancellationToken,
-    /// 是否启用回声模式
-    #[allow(dead_code)]
-    pub echo_mode: bool,
 }
 
 impl Default for MediaSessionOption {
@@ -31,7 +28,6 @@ impl Default for MediaSessionOption {
             rtp_start_port: 20000,
             external_ip: None,
             cancel_token: CancellationToken::new(),
-            echo_mode: false,
         }
     }
 }
@@ -91,7 +87,7 @@ pub async fn build_rtp_conn(
     let sdp = format!(
         "v=0\r\n\
         o=- 0 0 IN IP4 {}\r\n\
-        s=rsipstack example\r\n\
+        s=rsipstack\r\n\
         c=IN IP4 {}\r\n\
         t=0 0\r\n\
         m=audio {} RTP/AVP {codec}\r\n\
@@ -122,9 +118,12 @@ pub async fn play_echo(
     ssrc: u32,
 ) -> Result<()> {
     use rsipstack::transport::SipAddr;
+    use rtp_rs::RtpReader;
 
     info!("✓ RTP 回声模式已启动");
     let mut packet_count = 0u64;
+    let mut seq = 0u16;
+    let mut ts = 0u32;
 
     // 将对端地址解析为 SipAddr
     let peer_sip_addr = SipAddr {
@@ -167,7 +166,7 @@ pub async fn play_echo(
         _ = async {
             loop {
                 let mut mbuf = vec![0; 1500];
-                let (len, addr) = match conn.recv_raw(&mut mbuf).await {
+                let (len, _addr) = match conn.recv_raw(&mut mbuf).await {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!("接收 RTP 数据失败: {:?}", e);
@@ -177,17 +176,48 @@ pub async fn play_echo(
 
                 packet_count += 1;
                 if packet_count == 1 {
-                    info!("✓ 开始接收 RTP 数据包，对端地址: {}", addr.addr);
+                    info!("✓ 开始接收 RTP 数据包");
                 } else if packet_count % 50 == 0 {
                     tracing::debug!("已处理 {} 个 RTP 数据包", packet_count);
                 }
 
-                match conn.send_raw(&mbuf[..len], &addr).await {
-                    Ok(_) => {},
+                // 解析接收到的 RTP 包
+                let rtp_reader = match RtpReader::new(&mbuf[..len]) {
+                    Ok(r) => r,
                     Err(e) => {
-                        tracing::error!("发送 RTP 数据失败: {:?}", e);
-                        break;
+                        tracing::warn!("解析 RTP 包失败: {:?}", e);
+                        continue;
                     }
+                };
+
+                // 提取有效载荷
+                let payload = rtp_reader.payload();
+                let payload_type = rtp_reader.payload_type();
+
+                // 用我们自己的 SSRC 重新打包
+                let echo_packet = match RtpPacketBuilder::new()
+                    .payload_type(payload_type)
+                    .ssrc(ssrc)
+                    .sequence(seq.into())
+                    .timestamp(ts)
+                    .payload(payload)
+                    .build()
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!("构建回声 RTP 包失败: {:?}", e);
+                        continue;
+                    }
+                };
+
+                // 更新序列号和时间戳
+                seq = seq.wrapping_add(1);
+                ts = ts.wrapping_add(payload.len() as u32);
+
+                // 发送回声包
+                if let Err(e) = conn.send_raw(&echo_packet, &peer_sip_addr).await {
+                    tracing::error!("发送回声 RTP 包失败: {:?}", e);
+                    break;
                 }
             }
         } => {}
