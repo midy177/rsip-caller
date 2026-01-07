@@ -23,9 +23,9 @@ pub struct Registration {
     pub contact: Option<rsip::typed::Contact>,
     pub allow: rsip::headers::Allow,
     pub public_address: Option<rsip::HostWithPort>,
-    pub call_id: rsip::headers::CallId,
+    pub call_id: Option<rsip::headers::CallId>,
     /// Outbound 代理地址（可选）
-    pub proxy_addr: Option<String>,
+    pub outbound_proxy: Option<rsip::Uri>,
 }
 
 impl Registration {
@@ -36,13 +36,7 @@ impl Registration {
     /// - `credential`: 认证凭证
     /// - `proxy_addr`: 可选的 Outbound 代理地址
     /// - `call_id`: 可选的 Call-ID header，如果为 None 则自动生成
-    pub fn new(
-        endpoint: EndpointInnerRef,
-        credential: Option<Credential>,
-        proxy_addr: Option<String>,
-        call_id: Option<rsip::headers::CallId>,
-    ) -> Self {
-        let call_id = call_id.unwrap_or_else(|| make_call_id(endpoint.option.callid_suffix.as_deref()));
+    pub fn new(endpoint: EndpointInnerRef, credential: Option<Credential>, ) -> Self {
         Self {
             last_seq: 0,
             endpoint,
@@ -50,9 +44,19 @@ impl Registration {
             contact: None,
             allow: Default::default(),
             public_address: None,
-            call_id,
-            proxy_addr,
+            call_id: None,
+            outbound_proxy: None,
         }
+    }
+
+    pub fn set_call_id(mut self, call_id: rsip::headers::CallId) -> Self {
+        self.call_id = Some(call_id);
+        self
+    }
+
+    pub fn set_outbound_proxy(mut self, outbound_proxy: rsip::Uri) -> Self {
+        self.outbound_proxy = Some(outbound_proxy);
+        self
     }
 
     /// 执行 SIP 注册（参考 rsipstack 实现，支持自动代理检测）
@@ -109,12 +113,11 @@ impl Registration {
             }
         });
 
-        // ★ 核心改动：根据是否配置代理自动选择 Request-URI
-        let request_uri = if let Some(ref proxy) = self.proxy_addr {
-            info!("使用 Outbound 代理模式: proxy={}", proxy);
-            format!("sip:{}", proxy).as_str().try_into()?
+        let request_uri = if let Some(ref proxy) = self.outbound_proxy {
+            debug!("use Outbound proxy mode: proxy={}", proxy);
+            proxy.clone()
         } else {
-            info!("使用标准注册模式");
+            debug!("Use standard mode");
             server.clone()
         };
 
@@ -129,8 +132,14 @@ impl Registration {
             None,
         );
 
+        let call_id = self.call_id.clone().unwrap_or_else(|| {
+            let new_call_id = make_call_id(self.endpoint.option.callid_suffix.as_deref());
+            self.call_id = Some(new_call_id.clone());  // ← 保存生成的 call_id
+            new_call_id
+        });
+
         // 添加必要的 headers（参考 rsipstack 实现）
-        request.headers.unique_push(self.call_id.clone().into());
+        request.headers.unique_push(call_id.into());
         request.headers.unique_push(contact.into());
         request.headers.unique_push(self.allow.clone().into());
         if let Some(expires) = expires {

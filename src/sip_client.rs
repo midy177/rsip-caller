@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
+use uuid::Uuid;
 
 /// SIP 客户端配置
 pub struct SipClientConfig {
@@ -162,12 +162,11 @@ impl SipClient {
         let register_uri_str = format!("sip:{}", self.config.server);
         let server_uri_parsed: rsip::Uri = register_uri_str.as_str().try_into()?;
 
+
         info!("Register URI: {}", register_uri_str);
 
         // 生成 Call-ID
-        let call_id = utils::make_call_id(
-            self.endpoint.inner.option.callid_suffix.as_deref()
-        );
+        let call_id = Uuid::new_v4().to_string().into();
         info!("生成注册 Call-ID: {}", call_id);
 
         // 创建认证凭证
@@ -177,14 +176,16 @@ impl SipClient {
             realm: None, // 将从 401 响应自动提取
         };
 
-        // 创建 Registration 实例（传递 call_id）
+        // 创建 Registration 实例
         let mut registration = crate::sip_registration::Registration::new(
             self.endpoint.inner.clone(),
             Some(credential),
-            self.config.outbound_proxy.clone(),
-            Option::from(call_id),
-        );
+        ).set_call_id(call_id);
 
+        if let Some(outbound_proxy_uri) = self.config.outbound_proxy.clone() {
+            let outbound_proxy_uri_parsed: rsip::Uri = format!("sip:{}", outbound_proxy_uri).as_str().try_into()?;
+            registration = registration.set_outbound_proxy(outbound_proxy_uri_parsed);
+        }
         // 执行注册
         let response = registration.register(server_uri_parsed, Some(3600)).await?;
 
