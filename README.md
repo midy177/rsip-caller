@@ -214,6 +214,18 @@ cargo run -- \
 - 确保防火墙允许连接到代理服务器
 - 代理和目标服务器可以使用不同的端口
 
+#### 技术实现
+
+SIP Caller 使用 rsipstack 的 TransportLayer 内置的 outbound 代理支持，直接通过设置 `TransportLayer.outbound` 字段来配置代理，确保：
+- 连接逻辑更清晰
+- 代码更符合 rsipstack 设计
+- 减少不必要的中间步骤
+
+代理 URI 支持完整格式，如 `sip:proxy.example.com:5060;transport=tcp;lr`，系统会自动：
+- 提取 transport 协议
+- 添加 lr 参数（如果缺失）
+- 正确设置连接目标
+
 ### 运行测试
 
 ```bash
