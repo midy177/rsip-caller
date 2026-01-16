@@ -21,11 +21,13 @@
 ```
 sip-caller/
 ├── src/
-│   ├── main.rs        # 主程序示例
-│   ├── config.rs      # 协议配置定义
-│   ├── transport.rs   # 传输层辅助函数
+│   ├── main.rs        # 主程序示例，包含命令行参数解析
+│   ├── config.rs      # 协议配置定义，包括 Protocol 枚举
+│   ├── sip_client.rs  # SIP 客户端核心模块，处理注册和呼叫
+│   ├── sip_dialog.rs  # SIP 对话层处理
+│   ├── sip_transport.rs # 传输层辅助函数，包括 UDP 连接创建
 │   ├── rtp.rs         # RTP 处理模块
-│   └── utils.rs       # 工具函数
+│   └── utils.rs       # 工具函数，包括日志初始化和网络接口获取
 ├── Cargo.toml         # 项目依赖配置
 └── README.md          # 项目文档
 ```
@@ -35,10 +37,13 @@ sip-caller/
 - `tokio` - 异步运行时，处理并发网络 I/O
 - `rsipstack` - SIP 协议栈实现（支持 UDP/TCP/WebSocket）
 - `rsip` - SIP 消息解析
-- `thiserror` - 自定义错误类型
 - `tracing` - 结构化日志
 - `uuid` - 呼叫 ID 生成和管理
 - `clap` - 命令行参数解析（支持环境变量）
+- `rand` - 随机数生成
+- `tokio-util` - Tokio 工具库
+- `get_if_addrs` - 网络接口获取
+- `rtp-rs` - RTP 处理库
 
 ## 快速开始
 
@@ -108,7 +113,6 @@ cargo run
 | 参数 | 短参数 | 环境变量 | 默认值 | 说明 |
 |------|--------|----------|--------|------|
 | `--server` | `-s` | `SIP_SERVER` | `127.0.0.1:5060` | SIP 服务器地址 |
-| `--protocol` | - | - | `udp` | 传输协议类型（udp/tcp/ws/wss） |
 | `--outbound-proxy` | - | - | 无 | Outbound 代理服务器地址（可选） |
 | `--user` | `-u` | `SIP_USER` | `alice@example.com` | SIP 用户 ID |
 | `--password` | `-p` | `SIP_PASSWORD` | `password` | SIP 密码 |
@@ -116,8 +120,7 @@ cargo run
 | `--local-port` | - | - | `0` | 本地 SIP 端口（0 表示自动分配） |
 | `--ipv6` | - | - | `false` | 优先使用 IPv6（找不到时自动回退到 IPv4） |
 | `--rtp-start-port` | - | - | `20000` | RTP 起始端口 |
-| `--echo-mode` | - | - | `true` | 是否启用回声模式 |
-| `--user-agent` | - | - | `RSipCaller/0.2.0` | 用户代理字符串 |
+| `--user-agent` | - | - | `RSipCaller/0.2.0` | User-Agent 标识 |
 | `--log-level` | `-l` | - | `info` | 日志级别（trace/debug/info/warn/error） |
 
 ### 协议类型说明
@@ -328,42 +331,42 @@ async fn main() {
 - 客户端管理器使用 `Arc` 包装，支持多线程访问
 - 所有网络操作都是异步的，避免阻塞
 
-## 测试覆盖
+### 文档
 
-项目包含全面的测试：
-
-### 单元测试
-
-- 错误类型创建和显示
-- SIP 配置验证
-- 客户端创建
-- 配置选项定制
-
-### 文档测试
-
-- API 使用示例
-- 配置创建
-- 注册和呼叫流程
-
-运行测试查看覆盖：
-
-```bash
-cargo test
+```rust
+/// Doc comment for public items
+///
+/// This provides detailed documentation about the function, struct, or module.
+/// Include examples when helpful.
+///
+/// # Examples
+/// ```
+/// let config = SipConfig::new("127.0.0.1:5060", "user@example.com")?;
+/// ```
+pub fn create_client(config: SipConfig) -> Result<SipClient, SipCallerError> {
+    // Implementation
+}
 ```
 
-测试结果示例：
+### 测试
 
-```
-running 7 tests
-test error::tests::test_call_failed_error ... ok
-test error::tests::test_error_creation ... ok
-test error::tests::test_registration_error ... ok
-test tests::test_config_with_custom_codecs ... ok
-test tests::test_invalid_sip_address ... ok
-test tests::test_sip_config_creation ... ok
-test tests::test_client_creation ... ok
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-test result: ok. 7 passed; 0 failed
+    #[test]
+    fn test_sip_config_creation() {
+        let config = SipConfig::new("127.0.0.1:5060", "user@example.com").unwrap();
+        assert_eq!(config.server, "127.0.0.1:5060");
+    }
+
+    #[tokio::test]
+    async fn test_async_operation() {
+        let result = perform_async_operation().await;
+        assert!(result.is_ok());
+    }
+}
 ```
 
 ## 环境变量
@@ -389,8 +392,9 @@ test result: ok. 7 passed; 0 failed
 
 - 避免使用 `unsafe` 代码
 - 使用 Rust 所有权系统防止内存错误
-- 输入验证（SIP URI、地址解析）
+- 输入验证（SIP URIs、地址解析）
 - 错误边界清晰，防止 panic
+- Sanitize log output to prevent information leakage
 
 ## 编译检查
 
