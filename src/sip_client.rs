@@ -1,12 +1,19 @@
 /// SIP 客户端核心模块
 ///
 /// 提供高层次的SIP客户端功能封装
-use crate::{config::Protocol, rtp::{self, MediaSessionOption}, sip_dialog::process_dialog, sip_transport::{create_transport_connection, extract_peer_rtp_addr}, utils};
+use crate::{
+    rtp::{self, MediaSessionOption},
+    sip_dialog::process_dialog,
+    sip_transport::{create_transport_connection, extract_peer_rtp_addr},
+};
 use rand::Rng;
 use rsipstack::{
-    dialog::{authenticate::Credential, dialog_layer::DialogLayer, invitation::InviteOption},
+    dialog::{
+        authenticate::Credential, dialog_layer::DialogLayer, invitation::InviteOption,
+        registration::Registration,
+    },
     transaction::Endpoint,
-    transport::TransportLayer,
+    transport::{SipAddr, TransportLayer},
     EndpointBuilder,
 };
 use std::sync::Arc;
@@ -17,14 +24,12 @@ use uuid::Uuid;
 
 /// SIP 客户端配置
 pub struct SipClientConfig {
-    /// 服务器地址 (如 "xfc:5060" 或 "sip.example.com:5060")
-    pub server: String,
+    /// 服务器 URI (例如 "sip:example.com:5060" 或 "sip:server:5060;transport=tcp")
+    pub server: rsip::Uri,
 
-    /// 传输协议
-    pub protocol: Protocol,
-
-    /// Outbound 代理地址（可选）
-    pub outbound_proxy: Option<String>,
+    /// Outbound 代理 URI（可选）
+    /// 完整URI格式，如 "sip:proxy.example.com:5060;transport=udp;lr"
+    pub outbound_proxy: Option<rsip::Uri>,
 
     /// SIP 用户名
     pub username: String,
@@ -68,17 +73,47 @@ impl SipClient {
         );
 
         // 创建传输层
-        let transport_layer = TransportLayer::new(cancel_token.clone());
+        let mut transport_layer = TransportLayer::new(cancel_token.clone());
 
-        // 物理连接目标：如果配置了代理则使用代理，否则使用服务器地址
-        let connection_target = config.outbound_proxy.as_ref().unwrap_or(&config.server);
+        // 确定实际使用的 protocol 和连接目标
+        let (protocol, connection_target) = if let Some(ref outbound_proxy) = config.outbound_proxy
+        {
+            // 有outbound_proxy：从proxy URI中提取transport
+            let protocol = crate::utils::extract_protocol_from_uri(outbound_proxy);
+            (protocol, outbound_proxy.host_with_port.to_string())
+        } else {
+            // 没有outbound_proxy：从server URI中提取transport
+            let protocol = crate::utils::extract_protocol_from_uri(&config.server);
+            (protocol, config.server.host_with_port.to_string())
+        };
 
-        // 创建传输连接
+        // 如果有outbound代理，设置TransportLayer的outbound字段
+        if let Some(ref outbound_proxy) = config.outbound_proxy {
+            // 从URI中提取host:port作为连接目标
+            let target = outbound_proxy.host_with_port.to_string();
+
+            // 创建SipAddr用于outbound配置
+            let sip_addr = SipAddr {
+                r#type: Some(protocol.into()),
+                addr: outbound_proxy.host_with_port.clone(),
+            };
+
+            // 设置TransportLayer的outbound字段
+            transport_layer.outbound = Some(sip_addr);
+
+            info!(
+                "配置 Outbound 代理: {} (transport: {})",
+                target,
+                protocol.as_str()
+            );
+        }
+
+        // 使用提取出的protocol创建传输连接
         let local_addr = format!("{}:{}", local_ip, config.local_port).parse()?;
         let connection = create_transport_connection(
-            config.protocol,
+            protocol,
             local_addr,
-            connection_target,
+            &connection_target,
             cancel_token.clone(),
         )
         .await?;
@@ -86,11 +121,13 @@ impl SipClient {
         transport_layer.add_transport(connection);
 
         // 创建端点
-        let endpoint = EndpointBuilder::new()
+        let mut endpoint_builder = EndpointBuilder::new();
+        endpoint_builder
             .with_cancel_token(cancel_token.clone())
             .with_transport_layer(transport_layer)
-            .with_user_agent(&config.user_agent)
-            .build();
+            .with_user_agent(&config.user_agent);
+
+        let endpoint = endpoint_builder.build();
 
         // 启动端点服务
         let endpoint_for_serve = endpoint.inner.clone();
@@ -128,7 +165,7 @@ impl SipClient {
                 tx = incoming.recv() => tx,
                 _ = cancel_token.cancelled() => None,
             } {
-                let method = transaction.original.method.clone();
+                let method = transaction.original.method;
                 debug!("收到传入请求: {}", method);
 
                 if let Some(mut dialog) = dialog_layer.match_dialog(&transaction.original) {
@@ -158,16 +195,15 @@ impl SipClient {
 
         info!("本地绑定的实际地址: {}", actual_local_addr);
 
-        // 构造注册URI（直接使用 config.server）
-        let register_uri_str = format!("sip:{}", self.config.server);
-        let server_uri_parsed: rsip::Uri = register_uri_str.as_str().try_into()?;
+        // 构造注册URI（从 config.server 复制并移除 transport 参数）
+        let mut register_uri = self.config.server.clone();
 
+        // 移除 transport 参数（如果有）registrar 不需要 transport 参数
+        register_uri
+            .params
+            .retain(|p| !matches!(p, rsip::Param::Transport(_)));
 
-        info!("Register URI: {}", register_uri_str);
-
-        // 生成 Call-ID
-        let call_id = Uuid::new_v4().to_string().into();
-        info!("生成注册 Call-ID: {}", call_id);
+        info!("Register URI: {}", register_uri);
 
         // 创建认证凭证
         let credential = Credential {
@@ -176,18 +212,12 @@ impl SipClient {
             realm: None, // 将从 401 响应自动提取
         };
 
-        // 创建 Registration 实例
-        let mut registration = crate::sip_registration::Registration::new(
-            self.endpoint.inner.clone(),
-            Some(credential),
-        ).set_call_id(call_id);
+        // 创建 Registration 实例（全局 route_set 已在 Endpoint 层面配置）
+        let mut registration = Registration::new(self.endpoint.inner.clone(), Some(credential));
 
-        if let Some(outbound_proxy_uri) = self.config.outbound_proxy.clone() {
-            let outbound_proxy_uri_parsed: rsip::Uri = format!("sip:{}", outbound_proxy_uri).as_str().try_into()?;
-            registration = registration.set_outbound_proxy(outbound_proxy_uri_parsed);
-        }
+        registration.call_id = Uuid::new_v4().to_string().into();
         // 执行注册
-        let response = registration.register(server_uri_parsed, Some(3600)).await?;
+        let response = registration.register(register_uri, Some(3600)).await?;
 
         if response.status_code == rsip::StatusCode::OK {
             info!("✔ 注册成功,响应状态: {}", response.status_code);
@@ -212,12 +242,14 @@ impl SipClient {
 
         let contact_uri_str = format!("sip:{}@{}", self.config.username, actual_local_addr);
 
-        // 构造 From/To URI（使用相同的域名部分）
-        let from_uri = format!("sip:{}@{}", self.config.username, self.config.server);
+        // 构造 From/To URI（使用服务器URI的域名部分）
+        let server_domain = self.config.server.host_with_port.to_string();
+
+        let from_uri = format!("sip:{}@{}", self.config.username, server_domain);
         let to_uri = if target.contains('@') {
             format!("sip:{}", target)
         } else {
-            format!("sip:{}@{}", target, self.config.server)
+            format!("sip:{}@{}", target, server_domain)
         };
 
         info!("Call信息 源：{} -> 目标：{}", from_uri, to_uri);
@@ -249,19 +281,7 @@ impl SipClient {
             realm: None, // 将从 401/407 响应自动提取
         };
 
-        // 如果配置了 Outbound 代理，设置 destination
-        let destination = if let Some(ref proxy) = self.config.outbound_proxy {
-            info!("使用 Outbound 代理：INVITE 将发送到 {}", proxy);
-            let proxy_host_port: rsip::HostWithPort = proxy.as_str().try_into()?;
-            let sip_addr = rsipstack::transport::SipAddr::new(
-                self.config.protocol.to_rsip_transport(),
-                proxy_host_port,
-            );
-            Some(sip_addr)
-        } else {
-            None
-        };
-
+        // 全局 route_set 已在 Endpoint 层面配置，INVITE 会自动使用
         let invite_opt = InviteOption {
             caller: from_uri.as_str().try_into()?,
             callee: to_uri.as_str().try_into()?,
@@ -269,10 +289,10 @@ impl SipClient {
             credential: Some(credential),
             caller_display_name: None,
             caller_params: vec![],
-            destination,
+            destination: None, // 让 rsipstack 自动从 Route header 解析
             content_type: Some("application/sdp".to_string()),
             offer: Some(sdp_offer.as_bytes().to_vec()),
-            headers: None,
+            headers: None, // 不需要手动添加，rsipstack 自动处理
             support_prack: false,
             call_id: Some(call_id_string),
         };

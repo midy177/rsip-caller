@@ -177,7 +177,7 @@ pub async fn play_echo(
                 packet_count += 1;
                 if packet_count == 1 {
                     info!("✓ 开始接收 RTP 数据包");
-                } else if packet_count % 50 == 0 {
+                } else if packet_count.is_multiple_of(50) {
                     tracing::debug!("已处理 {} 个 RTP 数据包", packet_count);
                 }
 
@@ -291,7 +291,7 @@ pub async fn play_audio_file(
                     .ssrc(ssrc)
                     .sequence(seq.into())
                     .timestamp(ts)
-                    .payload(&chunk)
+                    .payload(chunk)
                     .build() {
                     Ok(r) => r,
                     Err(e) => {

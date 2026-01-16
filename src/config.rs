@@ -1,13 +1,13 @@
 /// 传输协议配置模块
 ///
 /// 支持的 SIP 传输协议：UDP、TCP、WebSocket 和 TLS
-
 use std::str::FromStr;
 
 /// SIP 传输协议类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Protocol {
     /// UDP 传输协议（默认）
+    #[default]
     Udp,
     /// TCP 传输协议
     Tcp,
@@ -50,22 +50,6 @@ impl Protocol {
     pub fn is_websocket(&self) -> bool {
         matches!(self, Protocol::Ws | Protocol::Wss)
     }
-
-    /// 转换为 rsip 传输协议类型
-    pub fn to_rsip_transport(&self) -> rsip::transport::Transport {
-        match self {
-            Protocol::Udp => rsip::transport::Transport::Udp,
-            Protocol::Tcp => rsip::transport::Transport::Tcp,
-            Protocol::Ws => rsip::transport::Transport::Ws,
-            Protocol::Wss => rsip::transport::Transport::Wss,
-        }
-    }
-}
-
-impl Default for Protocol {
-    fn default() -> Self {
-        Protocol::Udp
-    }
 }
 
 impl FromStr for Protocol {
@@ -88,6 +72,33 @@ impl FromStr for Protocol {
 impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str().to_uppercase())
+    }
+}
+
+/// 从 rsip::Transport 转换为 Protocol
+impl From<rsip::transport::Transport> for Protocol {
+    fn from(transport: rsip::transport::Transport) -> Self {
+        match transport {
+            rsip::transport::Transport::Udp => Protocol::Udp,
+            rsip::transport::Transport::Tcp => Protocol::Tcp,
+            rsip::transport::Transport::Ws => Protocol::Ws,
+            rsip::transport::Transport::Wss => Protocol::Wss,
+            rsip::transport::Transport::Tls => Protocol::Tcp, // TLS over TCP
+            rsip::transport::Transport::Sctp => Protocol::Udp, // Fallback to UDP
+            rsip::transport::Transport::TlsSctp => Protocol::Tcp, // Fallback to TCP
+        }
+    }
+}
+
+/// 从 Protocol 转换为 rsip::Transport
+impl From<Protocol> for rsip::transport::Transport {
+    fn from(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::Udp => rsip::transport::Transport::Udp,
+            Protocol::Tcp => rsip::transport::Transport::Tcp,
+            Protocol::Ws => rsip::transport::Transport::Ws,
+            Protocol::Wss => rsip::transport::Transport::Wss,
+        }
     }
 }
 

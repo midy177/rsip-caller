@@ -1,9 +1,50 @@
 /// SIP 工具函数模块
 ///
 /// 提供自定义的 SIP 相关辅助函数，用于覆盖 rsipstack 的默认行为
-
+use crate::config::Protocol;
 use std::net::IpAddr;
-use uuid::Uuid;
+
+/// 从 SIP URI 中提取 transport 协议
+///
+/// 按照以下优先级提取:
+/// 1. 显式的 transport 参数 (如 ;transport=tcp)
+/// 2. 根据 URI scheme 推断 (sips -> TCP, sip -> UDP)
+///
+/// # 参数
+/// - `uri`: SIP URI 对象引用
+///
+/// # 返回
+/// 提取到的 Protocol 类型
+///
+/// # 示例
+/// ```rust,no_run
+/// use rsip::Uri;
+/// use sip_caller::utils::extract_protocol_from_uri;
+///
+/// let uri: Uri = "sip:example.com:5060;transport=tcp".try_into().unwrap();
+/// let protocol = extract_protocol_from_uri(&uri);
+/// assert_eq!(protocol, Protocol::Tcp);
+///
+/// let uri2: Uri = "sips:example.com:5061".try_into().unwrap();
+/// let protocol2 = extract_protocol_from_uri(&uri2);
+/// assert_eq!(protocol2, Protocol::Tcp); // sips 默认 TLS over TCP
+/// ```
+pub fn extract_protocol_from_uri(uri: &rsip::Uri) -> Protocol {
+    // 1. 优先从 transport 参数提取
+    uri.params
+        .iter()
+        .find_map(|p| match p {
+            rsip::Param::Transport(t) => Some((*t).into()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            // 2. 根据 scheme 返回默认值
+            match uri.scheme.as_ref() {
+                Some(rsip::Scheme::Sips) => Protocol::Tcp, // sips默认TLS over TCP
+                Some(rsip::Scheme::Sip) | Some(rsip::Scheme::Other(_)) | None => Protocol::Udp,
+            }
+        })
+}
 
 /// 初始化日志系统
 ///
@@ -108,120 +149,34 @@ pub fn get_first_non_loopback_interface(
     Err("未找到可用的网络接口".into())
 }
 
-/// 生成基于 UUID 的 Call-ID
-///
-/// 这个函数替代了 rsipstack 默认的 `make_call_id` 函数，
-/// 使用 UUID v4 代替随机文本，确保全局唯一性
-///
-/// # 参数
-/// * `domain` - 可选的域名后缀
-///
-/// # 示例
-/// ```rust
-/// let call_id = make_call_id(Some("example.com"));
-/// // 生成类似: "550e8400-e29b-41d4-a716-446655440000@example.com"
-///
-/// let call_id = make_call_id(None);
-/// // 生成类似: "550e8400-e29b-41d4-a716-446655440000"
-/// ```
-pub fn make_call_id(domain: Option<&str>) -> rsip::headers::CallId {
-    let uuid = Uuid::new_v4();
+#[test]
+fn test_get_first_non_loopback_interface_ipv4() {
+    // 测试优先 IPv4
+    let result = get_first_non_loopback_interface(false);
 
-    match domain {
-        Some(d) => format!("{}@{}", uuid, d).into(),
-        None => uuid.to_string().into(),
-    }
+    // 至少应该能找到一个接口（无论是 IPv4 还是 IPv6）
+    assert!(
+        result.is_ok(),
+        "应该能找到至少一个网络接口（可能回退到 IPv6）"
+    );
 }
 
-/// 生成带主机名的 Call-ID
-///
-/// # 参数
-/// * `hostname` - 主机名或域名
-#[allow(dead_code)]
-pub fn make_call_id_with_host(hostname: &str) -> rsip::headers::CallId {
-    make_call_id(Some(hostname))
+#[test]
+fn test_get_first_non_loopback_interface_ipv6() {
+    // 测试优先 IPv6
+    let result = get_first_non_loopback_interface(true);
+
+    // 至少应该能找到一个接口（可能回退到 IPv4）
+    assert!(
+        result.is_ok(),
+        "应该能找到至少一个网络接口（可能回退到 IPv4）"
+    );
 }
 
-/// 生成纯 UUID Call-ID（无域名后缀）
-#[allow(dead_code)]
-pub fn make_uuid_call_id() -> rsip::headers::CallId {
-    Uuid::new_v4().to_string().into()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_make_call_id_with_domain() {
-        let call_id = make_call_id(Some("example.com"));
-        let call_id_str = call_id.to_string();
-
-        assert!(call_id_str.contains("@example.com"));
-        assert!(call_id_str.len() > 36); // UUID 长度 + @ + domain
-    }
-
-    #[test]
-    fn test_make_call_id_without_domain() {
-        let call_id = make_call_id(None);
-        let call_id_str = call_id.to_string();
-
-        // UUID v4 格式: 8-4-4-4-12
-        assert_eq!(call_id_str.len(), 36);
-        assert!(!call_id_str.contains("@"));
-    }
-
-    #[test]
-    fn test_make_uuid_call_id() {
-        let call_id1 = make_uuid_call_id();
-        let call_id2 = make_uuid_call_id();
-
-        // 两次生成的 Call-ID 应该不同
-        assert_ne!(call_id1.to_string(), call_id2.to_string());
-    }
-
-    #[test]
-    fn test_make_call_id_uniqueness() {
-        let mut call_ids = std::collections::HashSet::new();
-
-        for _ in 0..1000 {
-            let call_id = make_call_id(Some("test.com"));
-            call_ids.insert(call_id.to_string());
-        }
-
-        // 1000 个 Call-ID 应该都是唯一的
-        assert_eq!(call_ids.len(), 1000);
-    }
-
-    #[test]
-    fn test_get_first_non_loopback_interface_ipv4() {
-        // 测试优先 IPv4
-        let result = get_first_non_loopback_interface(false);
-
-        // 至少应该能找到一个接口（无论是 IPv4 还是 IPv6）
-        assert!(
-            result.is_ok(),
-            "应该能找到至少一个网络接口（可能回退到 IPv6）"
-        );
-    }
-
-    #[test]
-    fn test_get_first_non_loopback_interface_ipv6() {
-        // 测试优先 IPv6
-        let result = get_first_non_loopback_interface(true);
-
-        // 至少应该能找到一个接口（可能回退到 IPv4）
-        assert!(
-            result.is_ok(),
-            "应该能找到至少一个网络接口（可能回退到 IPv4）"
-        );
-    }
-
-    #[test]
-    fn test_get_first_non_loopback_interface_return_type() {
-        // 测试返回的地址不是回环地址
-        if let Ok(addr) = get_first_non_loopback_interface(false) {
-            assert!(!addr.is_loopback(), "返回的地址不应该是回环地址");
-        }
+#[test]
+fn test_get_first_non_loopback_interface_return_type() {
+    // 测试返回的地址不是回环地址
+    if let Ok(addr) = get_first_non_loopback_interface(false) {
+        assert!(!addr.is_loopback(), "返回的地址不应该是回环地址");
     }
 }
