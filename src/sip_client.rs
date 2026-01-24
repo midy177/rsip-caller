@@ -309,7 +309,7 @@ impl SipClient {
         let dialog_id = dialog.id();
         info!(
             "✅ INVITE 请求已发送，Dialog -> Call-ID: {} From-Tag: {} To-Tag: {}",
-            dialog_id.call_id, dialog_id.from_tag, dialog_id.to_tag
+            dialog_id.call_id, dialog_id.local_tag, dialog_id.remote_tag
         );
 
         if let Some(resp) = response {

@@ -68,7 +68,12 @@ pub fn initialize_logging(log_level: &str) {
         }
     };
 
-    tracing_subscriber::fmt().with_max_level(level).init();
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_line_number(true)
+        .with_thread_names(true)
+        .with_thread_ids(true)
+        .init();
 }
 
 /// 获取第一个非回环的网络接口 IP 地址
