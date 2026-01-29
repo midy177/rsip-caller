@@ -68,7 +68,10 @@ pub fn initialize_logging(log_level: &str) {
         }
     };
 
-    tracing_subscriber::fmt().with_max_level(level).init();
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_line_number(true)
+        .init();
 }
 
 /// 获取第一个非回环的网络接口 IP 地址
@@ -99,9 +102,7 @@ pub fn initialize_logging(log_level: &str) {
 /// let local_ip_v4 = get_first_non_loopback_interface(false).unwrap();
 /// println!("本地IPv4: {}", local_ip_v4);
 /// ```
-pub fn get_first_non_loopback_interface(
-    prefer_ipv6: bool,
-) -> Result<IpAddr, Box<dyn std::error::Error>> {
+pub fn get_first_non_loopback_interface() -> Result<IpAddr, Box<dyn std::error::Error>> {
     let interfaces = get_if_addrs::get_if_addrs()?;
 
     let mut ipv4_addr = None;
@@ -125,25 +126,13 @@ pub fn get_first_non_loopback_interface(
         }
     }
 
-    // 根据优先级返回
-    if prefer_ipv6 {
-        // 优先 IPv6，回退到 IPv4
-        if let Some(addr) = ipv6_addr {
-            return Ok(addr);
-        }
-        if let Some(addr) = ipv4_addr {
-            tracing::info!("未找到 IPv6 接口，回退使用 IPv4: {}", addr);
-            return Ok(addr);
-        }
-    } else {
-        // 优先 IPv4，回退到 IPv6
-        if let Some(addr) = ipv4_addr {
-            return Ok(addr);
-        }
-        if let Some(addr) = ipv6_addr {
-            tracing::info!("未找到 IPv4 接口，回退使用 IPv6: {}", addr);
-            return Ok(addr);
-        }
+    // 优先 IPv4，回退到 IPv6
+    if let Some(addr) = ipv4_addr {
+        return Ok(addr);
+    }
+    if let Some(addr) = ipv6_addr {
+        tracing::info!("未找到 IPv4 接口，回退使用 IPv6: {}", addr);
+        return Ok(addr);
     }
 
     Err("未找到可用的网络接口".into())
@@ -152,7 +141,7 @@ pub fn get_first_non_loopback_interface(
 #[test]
 fn test_get_first_non_loopback_interface_ipv4() {
     // 测试优先 IPv4
-    let result = get_first_non_loopback_interface(false);
+    let result = get_first_non_loopback_interface();
 
     // 至少应该能找到一个接口（无论是 IPv4 还是 IPv6）
     assert!(
@@ -164,7 +153,7 @@ fn test_get_first_non_loopback_interface_ipv4() {
 #[test]
 fn test_get_first_non_loopback_interface_ipv6() {
     // 测试优先 IPv6
-    let result = get_first_non_loopback_interface(true);
+    let result = get_first_non_loopback_interface();
 
     // 至少应该能找到一个接口（可能回退到 IPv4）
     assert!(
@@ -176,7 +165,7 @@ fn test_get_first_non_loopback_interface_ipv6() {
 #[test]
 fn test_get_first_non_loopback_interface_return_type() {
     // 测试返回的地址不是回环地址
-    if let Ok(addr) = get_first_non_loopback_interface(false) {
+    if let Ok(addr) = get_first_non_loopback_interface() {
         assert!(!addr.is_loopback(), "返回的地址不应该是回环地址");
     }
 }

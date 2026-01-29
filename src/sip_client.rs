@@ -1,12 +1,8 @@
 /// SIP 客户端核心模块
 ///
 /// 提供高层次的SIP客户端功能封装
-use crate::{
-    rtp::{self, MediaSessionOption},
-    sip_dialog::process_dialog,
-    sip_transport::{create_transport_connection, extract_peer_rtp_addr},
-};
-use rand::Rng;
+use crate::error::CallError;
+use crate::sip_transport::create_transport_connection;
 use rsipstack::{
     dialog::{
         authenticate::Credential, dialog_layer::DialogLayer, invitation::InviteOption,
@@ -18,9 +14,12 @@ use rsipstack::{
 };
 use std::sync::Arc;
 use std::time::Duration;
+use rsip::Response;
+use rsipstack::dialog::client_dialog::ClientInviteDialog;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use crate::error::CallResult;
 
 /// SIP 客户端配置
 pub struct SipClientConfig {
@@ -37,15 +36,6 @@ pub struct SipClientConfig {
     /// SIP 密码
     pub password: String,
 
-    /// 本地绑定端口
-    pub local_port: u16,
-
-    /// 优先使用IPv6
-    pub prefer_ipv6: bool,
-
-    /// RTP起始端口
-    pub rtp_start_port: u16,
-
     /// User-Agent字符串
     pub user_agent: String,
 }
@@ -56,7 +46,6 @@ pub struct SipClient {
     endpoint: Endpoint,
     dialog_layer: Arc<DialogLayer>,
     cancel_token: CancellationToken,
-    local_ip: std::net::IpAddr,
 }
 
 impl SipClient {
@@ -65,7 +54,7 @@ impl SipClient {
         let cancel_token = CancellationToken::new();
 
         // 获取本地IP
-        let local_ip = crate::utils::get_first_non_loopback_interface(config.prefer_ipv6)?;
+        let local_ip = crate::utils::get_first_non_loopback_interface()?;
         info!(
             "检测到本地出口IP: {} ({})",
             local_ip,
@@ -109,7 +98,7 @@ impl SipClient {
         }
 
         // 使用提取出的protocol创建传输连接
-        let local_addr = format!("{}:{}", local_ip, config.local_port).parse()?;
+        let local_addr = format!("{}:{}", local_ip, 0).parse()?;
         let connection = create_transport_connection(
             protocol,
             local_addr,
@@ -150,7 +139,6 @@ impl SipClient {
             endpoint,
             dialog_layer,
             cancel_token,
-            local_ip,
         })
     }
 
@@ -182,14 +170,14 @@ impl SipClient {
     }
 
     /// 执行注册
-    pub async fn register(&self) -> Result<rsip::Response, Box<dyn std::error::Error>> {
+    pub async fn register(&self) -> CallResult<Response> {
         info!("正在注册到 SIP 服务器...");
 
         let actual_local_addr = self
             .endpoint
             .get_addrs()
             .first()
-            .ok_or("未找到地址")?
+            .ok_or(CallError::NotInitialized)?
             .addr
             .clone();
 
@@ -217,26 +205,54 @@ impl SipClient {
 
         registration.call_id = Uuid::new_v4().to_string().into();
         // 执行注册
-        let response = registration.register(register_uri, Some(3600)).await?;
-
+        let response = registration.register(register_uri.clone(), Some(3600)).await?;
+        
         if response.status_code == rsip::StatusCode::OK {
             info!("✔ 注册成功,响应状态: {}", response.status_code);
         } else {
             warn!("注册响应: {}", response.status_code);
+            
+            // 根据状态码返回适当的错误
+            match response.status_code {
+                rsip::StatusCode::Unauthorized => {
+                    return Err(CallError::AuthenticationFailed { 
+                        reason: "认证失败".to_string() 
+                    });
+                }
+                rsip::StatusCode::NotFound => {
+                    return Err(CallError::InvalidTarget { 
+                        target: "注册目标未找到".to_string() 
+                    });
+                }
+                rsip::StatusCode::ServerInternalError |
+                rsip::StatusCode::ServiceUnavailable => {
+                    let port = register_uri.host_with_port.port.unwrap_or_else(|| 5060.into());
+                    return Err(CallError::NetworkConnection { 
+                        host: register_uri.host_with_port.to_string(),
+                        port: port.into()
+                    });
+                }
+                _ => {
+                    return Err(CallError::Other(
+                        format!("注册失败: {} {}", response.status_code, 
+                                String::from_utf8_lossy(&response.body)).into()
+                    ));
+                }
+            }
         }
-
+        
         Ok(response)
     }
 
     /// 发起呼叫
-    pub async fn make_call(&self, target: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn make_call(&self, target: &str,sdp_offer: &str) -> CallResult<(ClientInviteDialog, Option<Response>)> {
         info!("📞发起呼叫到: {}", target);
 
         let actual_local_addr = self
             .endpoint
             .get_addrs()
             .first()
-            .ok_or("未找到地址")?
+            .ok_or(CallError::NotInitialized)?
             .addr
             .clone();
 
@@ -254,24 +270,9 @@ impl SipClient {
 
         info!("Call信息 源：{} -> 目标：{}", from_uri, to_uri);
 
-        // 创建 RTP 会话
-        let rtp_cancel = self.cancel_token.child_token();
-        let media_opt = MediaSessionOption {
-            rtp_start_port: self.config.rtp_start_port,
-            external_ip: None,
-            cancel_token: rtp_cancel.clone(),
-        };
-
-        let ssrc = rand::rng().random::<u32>();
-        let payload_type = 0u8; // PCMU
-
-        let (rtp_conn, sdp_offer) =
-            rtp::build_rtp_conn(self.local_ip, &media_opt, ssrc, payload_type).await?;
-
-        debug!("SDP Offer:{}", sdp_offer);
 
         // 生成呼叫 Call-ID（直接使用 UUID 字符串）
-        let call_id_string = uuid::Uuid::new_v4().to_string();
+        let call_id_string = Uuid::new_v4().to_string();
         info!("生成呼叫 Call-ID: {}", call_id_string);
 
         // 创建认证凭证
@@ -298,7 +299,7 @@ impl SipClient {
         };
 
         // 创建状态通道
-        let (state_sender, state_receiver) = self.dialog_layer.new_dialog_state_channel();
+        let (state_sender, _state_receiver) = self.dialog_layer.new_dialog_state_channel();
 
         // 发送 INVITE
         let (dialog, response) = self
@@ -309,62 +310,67 @@ impl SipClient {
         let dialog_id = dialog.id();
         info!(
             "✅ INVITE 请求已发送，Dialog -> Call-ID: {} From-Tag: {} To-Tag: {}",
-            dialog_id.call_id, dialog_id.from_tag, dialog_id.to_tag
+            dialog_id.call_id, dialog_id.local_tag, dialog_id.remote_tag
         );
 
-        if let Some(resp) = response {
-            info!("响应状态: {}", resp.status_code());
+        // if let Some(resp) = response {
+        //     info!("响应状态: {}", resp.status_code());
+        //
+        //     // 处理 SDP Answer
+        //     let body = resp.body();
+        //     if !body.is_empty() {
+        //         let sdp_answer = String::from_utf8_lossy(body);
+        //         debug!("SDP Answer: {}", sdp_answer);
+        //     }
+        // }
 
-            // 处理 SDP Answer
-            let body = resp.body();
-            if !body.is_empty() {
-                let sdp_answer = String::from_utf8_lossy(body);
-                debug!("SDP Answer: {}", sdp_answer);
+        Ok((dialog, response))
+    }
 
-                if let Some(peer_addr) = extract_peer_rtp_addr(&sdp_answer) {
-                    info!("✓ 对端 RTP 地址: {}", peer_addr);
-
-                    // 启动对话状态监控
-                    let dialog_clone = Arc::new(dialog.clone());
-                    let rtp_cancel_clone = rtp_cancel.clone();
-                    tokio::spawn(async move {
-                        process_dialog(dialog_clone, state_receiver, rtp_cancel_clone).await;
-                    });
-
-                    // 启动 RTP 回声
-                    info!("🔊 启动回声模式");
-                    let rtp_cancel_clone = rtp_cancel.clone();
-                    let peer_addr_clone = peer_addr.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            rtp::play_echo(rtp_conn, rtp_cancel_clone, peer_addr_clone, ssrc).await
-                        {
-                            error!("RTP 回声播放失败: {}", e);
-                        }
-                    });
-
-                    // 等待用户挂断
-                    info!("📞 通话中，按 Ctrl+C 手动挂断");
-                    tokio::signal::ctrl_c().await?;
-
-                    // 挂断呼叫
-                    match dialog.bye().await {
-                        Ok(_) => {
-                            info!("✅ 通话结束");
-                        }
-                        Err(e) => {
-                            warn!("发送 BYE 失败: {}", e);
-                        }
-                    }
-
-                    rtp_cancel.cancel();
-                } else {
-                    error!("无法从 SDP Answer 中提取对端 RTP 地址");
-                }
-            }
+    /// 注销
+    pub async fn unregister(&self) -> CallResult<Response> {
+        info!("正在从SIP服务器注销...");
+        
+        let _actual_local_addr = self
+            .endpoint
+            .get_addrs()
+            .first()
+            .ok_or(CallError::NotInitialized)?
+            .addr
+            .clone();
+        
+        // 构造注册URI（从 config.server 复制并移除 transport 参数）
+        let mut register_uri = self.config.server.clone();
+        
+        // 移除 transport 参数（如果有）registrar 不需要 transport 参数
+        register_uri
+            .params
+            .retain(|p| !matches!(p, rsip::Param::Transport(_)));
+        
+        info!("Unregister URI: {}", register_uri);
+        
+        // 创建认证凭证
+        let credential = Credential {
+            username: self.config.username.clone(),
+            password: self.config.password.clone(),
+            realm: None, // 将从 401 响应自动提取
+        };
+        
+        // 创建 Registration 实例（全局 route_set 已在 Endpoint 层面配置）
+        let mut registration = Registration::new(self.endpoint.inner.clone(), Some(credential));
+        
+        registration.call_id = Uuid::new_v4().to_string().into();
+        
+        // 执行注销（expires=0表示注销）
+        let response = registration.register(register_uri, Some(0)).await?;
+        
+        if response.status_code == rsip::StatusCode::OK {
+            info!("✔ 注销成功,响应状态: {}", response.status_code);
+        } else {
+            warn!("注销响应: {}", response.status_code);
         }
-
-        Ok(())
+        
+        Ok(response)
     }
 
     /// 关闭客户端

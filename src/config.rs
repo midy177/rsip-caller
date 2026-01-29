@@ -102,6 +102,65 @@ impl From<Protocol> for rsip::transport::Transport {
     }
 }
 
+/// SIP客户端配置
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub server: String,
+    pub username: String,
+    pub password: String,
+    pub domain: String,
+    pub port: u16,
+    pub transport: Protocol,
+    pub user_agent: String,
+}
+
+impl Config {
+    /// 创建新的配置
+    pub fn new(
+        server: &str,
+        user: &str,
+        password: &str,
+    ) -> Result<Self, crate::error::ConfigError> {
+        let (domain, port, transport) = Self::parse_server(server)?;
+
+        Ok(Self {
+            server: server.to_string(),
+            username: user.to_string(),
+            password: password.to_string(),
+            domain,
+            port,
+            transport,
+            user_agent: "sip-caller/0.1.0".to_string(),
+        })
+    }
+
+    /// 解析服务器地址
+    fn parse_server(server: &str) -> Result<(String, u16, Protocol), crate::error::ConfigError> {
+        let parts: Vec<&str> = server.split(';').collect();
+        let addr_part = parts[0];
+
+        let (domain, port) = if addr_part.contains(':') {
+            let mut split = addr_part.split(':');
+            let domain = split.next().ok_or("Missing domain")?.to_string();
+            let port_str = split.next().ok_or("Missing port")?;
+            let port = port_str.parse::<u16>().map_err(|_| "Invalid port number")?;
+            (domain, port)
+        } else {
+            (addr_part.to_string(), 5060)
+        };
+
+        let transport = parts
+            .iter()
+            .skip(1)
+            .find_map(|p| p.strip_prefix("transport="))
+            .unwrap_or("udp")
+            .parse::<Protocol>()
+            .map_err(|e| crate::error::ConfigError::Invalid(format!("Invalid transport: {}", e)))?;
+
+        Ok((domain, port, transport))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

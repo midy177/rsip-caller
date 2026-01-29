@@ -14,8 +14,6 @@ use tracing::info;
 /// 媒体会话配置选项
 #[derive(Debug, Clone)]
 pub struct MediaSessionOption {
-    /// RTP 起始端口
-    pub rtp_start_port: u16,
     /// 外部 IP 地址（用于 NAT 穿透）
     pub external_ip: Option<String>,
     /// 取消令牌
@@ -25,7 +23,6 @@ pub struct MediaSessionOption {
 impl Default for MediaSessionOption {
     fn default() -> Self {
         Self {
-            rtp_start_port: 20000,
             external_ip: None,
             cancel_token: CancellationToken::new(),
         }
@@ -52,7 +49,7 @@ pub async fn build_rtp_conn(
 
     // 尝试绑定 100 个端口
     for p in 0..100 {
-        let port = opt.rtp_start_port + p * 2;
+        let port = 20000 + p * 2;
         let addr = format!("{}:{}", local_ip, port).parse()?;
 
         if let Ok(c) = UdpConnection::create_connection(
@@ -137,7 +134,7 @@ pub async fn play_echo(
     info!("发送初始静音包以激活 RTP 流...");
     let silence_packet = vec![0u8; 160]; // G.711 静音包
     for i in 0..5 {
-        let rtp_packet = match rtp_rs::RtpPacketBuilder::new()
+        let rtp_packet = match RtpPacketBuilder::new()
             .payload_type(0) // PCMU
             .ssrc(ssrc)
             .sequence((i as u16).into())

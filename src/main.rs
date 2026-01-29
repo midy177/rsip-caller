@@ -1,134 +1,453 @@
 use clap::Parser;
-mod config;
-mod rtp;
-/// SIP Caller 主程序（使用 rsipstack）
-///
-/// 演示如何使用 rsipstack 进行注册和呼叫
-mod sip_client;
-mod sip_dialog;
-mod sip_transport;
-mod utils;
+use sip_caller::{create_sip_client_with_proxy, create_audio_player, create_video_player, create_rtp_session, MediaKind, utils};
+use sip_caller::rtp_play::{AudioEchoPlayer, MediaPlayer};
+use std::io::{self, Write};
 
-use sip_client::{SipClient, SipClientConfig};
-use tracing::info;
+use std::time::Duration;
+use rsipstack::dialog::dialog::{DialogState, TerminatedReason};
 
-/// 解析 SIP URI，支持简单格式和完整 URI 格式
-///
-/// 简单格式如 "example.com:5060" 会自动添加 "sip:" scheme
-/// 完整格式如 "sip:example.com:5060;transport=tcp" 直接解析
-fn parse_sip_uri(s: &str) -> Result<rsip::Uri, String> {
-    // 如果不包含 scheme，添加默认的 sip:
-    let uri_with_scheme = if !s.contains(':') || s.chars().filter(|&c| c == ':').count() == 1 {
-        format!("sip:{}", s)
-    } else {
-        s.to_string()
-    };
+use tracing::{info, error};
 
-    uri_with_scheme
-        .as_str()
-        .try_into()
-        .map_err(|e: rsip::Error| format!("无效的 SIP URI '{}': {}", s, e))
-}
 
-/// SIP Caller - 基于 Rust 的 SIP 客户端
-#[derive(Parser, Debug)]
-#[command(name = "sip-caller")]
-#[command(author = "SIP Caller Team")]
-#[command(version = "0.2.0")]
-#[command(about = "SIP 客户端，支持注册和呼叫功能", long_about = None)]
+/// SIP Caller CLI Application
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
 struct Args {
-    /// SIP 服务器地址
-    /// 支持多种格式：
-    ///   - 简单格式: "example.com:5060" (默认UDP)
-    ///   - 完整URI: "sip:example.com:5060;transport=tcp"
-    ///   - SIPS URI: "sips:example.com:5061" (自动使用TLS over TCP)
-    #[arg(short, long, value_parser = parse_sip_uri, default_value = "xfc:5060")]
-    server: rsip::Uri,
-
-    /// Outbound 代理服务器地址（可选）
-    /// 支持完整URI格式，例如: "sip:proxy.example.com:5060;transport=udp;lr"
-    /// Transport参数将自动从URI中提取
-    #[arg(long, value_parser = parse_sip_uri)]
-    outbound_proxy: Option<rsip::Uri>,
-
-    /// SIP 用户 ID（例如：alice@example.com）
-    #[arg(short, long, default_value = "1001")]
-    user: String,
-
-    /// SIP 密码
-    #[arg(short, long, default_value = "admin")]
-    password: String,
-
-    /// 呼叫目标（例如：bob@example.com）
-    #[arg(short, long, default_value = "1000")]
-    target: String,
-
-    /// 本地 SIP 端口
-    #[arg(long, default_value = "0")]
-    local_port: u16,
-
-    /// 优先使用 IPv6（找不到时自动回退到 IPv4）
-    #[arg(long, default_value = "false")]
-    ipv6: bool,
-
-    /// RTP 起始端口
-    #[arg(long, default_value = "20000")]
-    rtp_start_port: u16,
-
-    /// User-Agent 标识
-    #[arg(long, default_value = "RSipCaller/0.2.0")]
-    user_agent: String,
-
-    /// 日志级别 (trace, debug, info, warn, error)
+    /// SIP server address (e.g., 127.0.0.1:5060)
+    #[arg(short, long)]
+    server: Option<String>,
+    
+    /// SIP username (e.g., user@example.com)
+    #[arg(short, long)]
+    user: Option<String>,
+    
+    /// SIP password
+    #[arg(short, long)]
+    password: Option<String>,
+    
+    /// Outbound proxy server (e.g., sip:proxy.example.com:5060;transport=udp;lr)
+    #[arg(short, long)]
+    outbound_proxy: Option<String>,
+    
+    /// Media file path for RTP streaming
+    #[arg(short = 'f', long)]
+    media: Option<String>,
+    
+    /// Media type (audio/video)
+    #[arg(long, default_value = "auto")]
+    media_type: String,
+    
+    /// Operation mode (call/echo/media)
+    #[arg(short, long, default_value = "call")]
+    mode: String,
+    
+    /// Call target (user@domain)
+    #[arg(short, long)]
+    target: Option<String>,
+    
+    /// Log level
     #[arg(short, long, default_value = "info")]
     log_level: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 解析命令行参数
     let args = Args::parse();
-
-    // 初始化日志系统
-    utils::initialize_logging(&args.log_level);
-
-    info!(
-        "SIP Caller 启动 - 服务器: {}, 代理: {}, 用户: {}, 目标: {}, IPv6: {}, RTP端口: {}, User-Agent: {}",
-        args.server,
-        args.outbound_proxy.as_ref().map(|u| u.to_string()).unwrap_or_else(|| "无".to_string()),
-        args.user,
-        args.target,
-        args.ipv6,
-        args.rtp_start_port,
-        args.user_agent
-    );
-
-    // 创建客户端配置
-    let config = SipClientConfig {
-        server: args.server,
-        outbound_proxy: args.outbound_proxy,
-        username: args.user,
-        password: args.password,
-        local_port: args.local_port,
-        prefer_ipv6: args.ipv6,
-        rtp_start_port: args.rtp_start_port,
-        user_agent: args.user_agent,
-    };
-
-    // 创建 SIP 客户端
-    let client = SipClient::new(config).await?;
-
-    // 执行注册
-    let response = client.register().await?;
-    if response.status_code != rsip::StatusCode::OK {
-        return Err(format!("注册失败: {}", response.status_code).into());
+    utils::initialize_logging(args.log_level.as_str());
+    match args.mode.as_str() {
+        "call" => run_call_mode(&args).await,
+        "echo" => run_echo_mode(&args).await,
+        "media" => run_media_mode(&args).await,
+        _ => {
+            eprintln!("Invalid mode. Use 'call', 'echo', or 'media'");
+            Ok(())
+        }
     }
+}
 
-    // 发起呼叫
-    client.make_call(&args.target).await?;
+async fn run_call_mode(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let server = args.server.clone()
+        .or_else(|| std::env::var("SIP_SERVER").ok())
+        .ok_or("SIP server address is required")?;
+    
+    let user = args.user.clone()
+        .or_else(|| std::env::var("SIP_USER").ok())
+        .ok_or("SIP user is required")?;
+    
+    let password = args.password.clone()
+        .or_else(|| std::env::var("SIP_PASSWORD").ok())
+        .unwrap_or_else(|| "password".to_string());
+    
+    let target = args.target.clone()
+        .or_else(|| std::env::var("SIP_TARGET").ok())
+        .ok_or("Call target is required in call mode")?;
 
-    // 关闭客户端
-    client.shutdown().await;
-
+    info!("Creating SIP client for {}: {}", server, user);
+    
+    let client = create_sip_client_with_proxy(
+        &server, 
+        &user, 
+        &password, 
+        args.outbound_proxy.as_deref()
+    ).await?;
+    
+    if let Some(media_path) = &args.media {
+        let media_type = detect_media_type(media_path, &args.media_type)?;
+        
+        info!("Creating RTP session for media: {}", media_path);
+        let (mut rtp_player, local_sdp) = create_rtp_session(media_type).await?;
+        
+        println!("Local SDP:");
+        println!("{}", local_sdp);
+        
+        print!("Enter remote SDP: ");
+        io::stdout().flush()?;
+        let mut remote_sdp = String::new();
+        io::stdin().read_line(&mut remote_sdp)?;
+        
+        let media_player = match media_type {
+            MediaKind::Audio => create_audio_player(media_path).await?,
+            MediaKind::Video => create_video_player(media_path).await?,
+        };
+        
+        rtp_player.set_remote_sdp_and_play(&remote_sdp, media_player).await?;
+        
+        info!("Media streaming completed");
+    } else {
+        match client.register().await {
+            Ok(response) => {
+                info!("SIP registration completed successfully");
+                info!("Registration response: {}", response.status_code);
+            }
+            Err(e) => {
+                error!("SIP registration failed: {}", e);
+                error!("Error code: {}", e.error_code());
+                return Err(format!("SIP registration failed: {}", e).into());
+            }
+        }
+        
+        match client.make_call(&target, "").await {
+            Ok((dialog, response)) => {
+                info!("Call initiated successfully");
+                info!("Dialog ID: {:?}", dialog.id());
+                if let Some(resp) = response {
+                    info!("Call response: {}", resp.status_code);
+                }
+            }
+            Err(e) => {
+                error!("Call failed: {}", e);
+                error!("Error code: {}", e.error_code());
+                return Err(format!("Call failed: {}", e).into());
+            }
+        }
+        
+        tokio::signal::ctrl_c().await?;
+        info!("Shutting down...");
+    }
+    
     Ok(())
+}
+
+async fn run_echo_mode(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let server = args.server.clone()
+        .or_else(|| std::env::var("SIP_SERVER").ok())
+        .ok_or("SIP server address is required")?;
+    
+    let user = args.user.clone()
+        .or_else(|| std::env::var("SIP_USER").ok())
+        .ok_or("SIP user is required")?;
+    
+    let password = args.password.clone()
+        .or_else(|| std::env::var("SIP_PASSWORD").ok())
+        .unwrap_or_else(|| "password".to_string());
+
+    let target = args.target.clone()
+        .or_else(|| std::env::var("SIP_TARGET").ok())
+        .ok_or("Call target is required in call mode")?;
+
+    info!("Creating SIP client for echo mode: {}@{}", user, server);
+
+    let client = create_sip_client_with_proxy(
+        &server, 
+        &user, 
+        &password, 
+        args.outbound_proxy.as_deref()
+    ).await?;
+    
+    // Register with SIP server
+    match client.register().await {
+            Ok(response) => {
+                info!("SIP registration completed successfully");
+                info!("Registration response: {}", response.status_code);
+            }
+            Err(e) => {
+                error!("SIP registration failed: {}", e);
+                error!("Error code: {}", e.error_code());
+                return Err(format!("SIP registration failed: {}", e).into());
+            }
+        }
+    
+    // Handle echo calls
+    run_echo_mode_real(&client,&target).await?;
+    Ok(())
+}
+
+async fn run_echo_mode_real(client: &sip_caller::SipClient, target: &str) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Echo mode: making call to: {}", target);
+
+    // Create echo player
+    let (mut echo_player, local_sdp) = AudioEchoPlayer::new().await?;
+
+    // Make call to target with SDP offer
+    info!("Making echo call to: {}", target);
+    match client.make_call(&target, &local_sdp).await {
+        Ok((dialog, response)) => {
+            info!("Call initiated successfully");
+            info!("Dialog ID: {:?}", dialog.id());
+            
+            // Process response to get remote SDP
+            let remote_sdp = if let Some(resp) = response {
+                info!("Received response: {}", resp.status_code);
+                
+                // Extract SDP answer from response
+                let sdp_answer = extract_sdp_from_response(&resp)?;
+                if !sdp_answer.is_empty() {
+                    info!("Received SDP answer in response: {}", sdp_answer);
+                    Some(sdp_answer)
+                } else {
+                    // We'll need to wait for a re-INVITE with SDP or for SDP in ACK
+                    info!("No SDP in 200 OK, waiting for subsequent messages");
+                    None
+                }
+            } else {
+                info!("No response received");
+                None
+            };
+            
+            // If we got SDP, parse it to get the remote RTP address, otherwise wait for it
+            let final_remote_sdp = if let Some(sdp) = remote_sdp {
+                sdp
+            } else {
+                info!("Enter remote SDP for echo: ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                if input.trim().is_empty() {
+                    error!("No SDP provided");
+                    return Ok(());
+                }
+                input
+            };
+
+            // Initialize echo player
+            if let Err(e) = echo_player.initialize().await {
+                error!("Failed to initialize echo player: {}", e);
+                return Err(format!("Failed to initialize echo player: {}", e).into());
+            }
+            
+            // Set remote SDP
+            if let Err(e) = echo_player.set_remote_sdp(&final_remote_sdp).await {
+                error!("Failed to set remote SDP: {}", e);
+                return Err(format!("Failed to set remote SDP: {}", e).into());
+            }
+            
+            // Start echo mode
+            info!("Starting echo mode with SDP");
+
+            // Start echo mode using AudioEchoPlayer
+            // AudioEchoPlayer uses its internal PeerConnection
+            if let Err(e) = echo_player.start_echo().await {
+                error!("Echo mode failed: {}", e);
+                return Err(format!("Echo mode failed: {}", e).into());
+            }
+            info!("Echo mode active: audio will be echoed back to the caller");
+            // Wait for cancellation
+            loop {
+                match dialog.state() {
+                    DialogState::Terminated(_, TerminatedReason::UasBye) => {
+                        info!("对端主动挂断");
+                        echo_player.stop_echo();
+                        break;
+                    }
+                    DialogState::Terminated(_, reason) => {
+                        info!("通话结束: {:?}", reason);
+                        echo_player.stop_echo();
+                        break;
+                    }
+                    _ => {
+                        // 继续等待
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            info!("Echo mode completed");
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to make echo call: {}", e);
+            error!("Error code: {}", e.error_code());
+            return Err(format!("Echo call failed: {}", e).into());
+        }
+    }
+}
+
+// Helper function to extract SDP from response
+fn extract_sdp_from_response(response: &rsip::Response) -> Result<String, Box<dyn std::error::Error>> {
+    match response.status_code {
+        rsip::StatusCode::OK => {
+            let body = response.body();
+            if !body.is_empty() {
+                Ok(String::from_utf8_lossy(&body).to_string())
+            } else {
+                Err("No SDP in OK response".into())
+            }
+        }
+        rsip::StatusCode::Ringing => {
+            Err("Call is still ringing, no SDP yet".into())
+        }
+        _ => {
+            Err(format!("Call failed with status: {}", response.status_code).into())
+        }
+    }
+}
+
+async fn run_media_mode(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let server = args.server.clone()
+        .or_else(|| std::env::var("SIP_SERVER").ok())
+        .ok_or("SIP server address is required")?;
+    
+    let user = args.user.clone()
+        .or_else(|| std::env::var("SIP_USER").ok())
+        .ok_or("SIP user is required")?;
+    
+    let password = args.password.clone()
+        .or_else(|| std::env::var("SIP_PASSWORD").ok())
+        .unwrap_or_else(|| "password".to_string());
+    
+    let target = args.target.clone()
+        .or_else(|| std::env::var("SIP_TARGET").ok())
+        .ok_or("Call target is required in media mode")?;
+    
+    let media_file = args.media.clone()
+        .ok_or("Media file path is required in media mode")?;
+    
+    info!("Creating SIP client for media mode: {}@{}", user, server);
+    
+    let client = create_sip_client_with_proxy(
+        &server, 
+        &user, 
+        &password, 
+        args.outbound_proxy.as_deref()
+    ).await?;
+    
+    // Register with SIP server
+    match client.register().await {
+            Ok(response) => {
+                info!("SIP registration completed successfully");
+                info!("Registration response: {}", response.status_code);
+            }
+            Err(e) => {
+                error!("SIP registration failed: {}", e);
+                error!("Error code: {}", e.error_code());
+                return Err(format!("SIP registration failed: {}", e).into());
+            }
+        }
+    
+    // Create RTP session for media
+    let media_type_str = args.media_type.as_str();
+    let media_type = detect_media_type(&media_file, media_type_str)?;
+    let (mut rtp_player, local_sdp) = create_rtp_session(media_type).await?;
+    
+    println!("Local SDP for media mode:");
+    println!("{}", local_sdp);
+    
+    // Make call to target with SDP offer
+    info!("Making media call to: {}", target);
+    match client.make_call(&target, &local_sdp).await {
+        Ok((dialog, response)) => {
+            info!("Call initiated successfully");
+            info!("Dialog ID: {:?}", dialog.id());
+            
+            // Process response to get remote SDP
+            let remote_sdp = if let Some(resp) = response {
+                info!("Received response: {}", resp.status_code);
+                
+                // Extract SDP answer from response
+                let sdp_answer = extract_sdp_from_response(&resp)?;
+                if !sdp_answer.is_empty() {
+                    info!("Received SDP answer in response");
+                    Some(sdp_answer)
+                } else {
+                    // We'll need to wait for a re-INVITE with SDP or for SDP in ACK
+                    info!("No SDP in 200 OK, waiting for subsequent messages");
+                    None
+                }
+            } else {
+                info!("No response received");
+                None
+            };
+            
+            // If we got SDP, parse it to get the remote RTP address, otherwise wait for it
+            let final_remote_sdp = if let Some(sdp) = remote_sdp {
+                sdp
+            } else {
+                print!("Enter remote SDP for media: ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                if input.trim().is_empty() {
+                    error!("No SDP provided");
+                    return Ok(());
+                }
+                input
+            };
+            
+            // Create media player
+            let media_player = if media_type == MediaKind::Audio {
+                create_audio_player(&media_file).await?
+            } else {
+                create_video_player(&media_file).await?
+            };
+            
+            // Start media playback
+            info!("Starting media playback with SDP");
+            rtp_player.set_remote_sdp_and_play(&final_remote_sdp, media_player).await?;
+            
+            info!("Media playback active");
+            info!("Press Ctrl+C to exit");
+            
+            // Keep client running
+            tokio::signal::ctrl_c().await?;
+            info!("Shutting down...");
+            
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to make media call: {}", e);
+            error!("Error code: {}", e.error_code());
+            return Err(format!("Media call failed: {}", e).into());
+        }
+    }
+}
+// Helper function to detect media type
+fn detect_media_type(file_path: &str, media_type: &str) -> Result<MediaKind, Box<dyn std::error::Error>> {
+    if media_type == "auto" {
+        let path = std::path::Path::new(file_path);
+        let ext = path.extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        
+        match ext.as_str() {
+            "wav" => Ok(MediaKind::Audio),
+            "ivf" => Ok(MediaKind::Video),
+            _ => Err(Box::from("Unsupported media format")),
+        }
+    } else {
+        match media_type {
+            "audio" => Ok(MediaKind::Audio),
+            "video" => Ok(MediaKind::Video),
+            _ => Err(Box::from("Invalid media type")),
+        }
+    }
 }
